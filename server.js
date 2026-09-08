@@ -1,141 +1,198 @@
 const express = require("express");
-const dotenv = require("dotenv");
-
-dotenv.config();
+const session = require("express-session");
+const { Pool } = require("pg");
+require("dotenv").config();
 
 const app = express();
+
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+app.use(
+  session({
+    secret: process.env.SESSION_SECRET || "troque-esta-chave",
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      secure: false,
+      maxAge: 1000 * 60 * 60 * 8
+    }
+  })
+);
 
 const PORT = process.env.PORT || 3000;
 const PRICE_PER_HOUR = 30;
+const ROOMS = ["Sala 1", "Sala 2", "Sala 3"];
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const INFINITEPAY_HANDLE = process.env.INFINITEPAY_HANDLE;
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
 
-async function supabase(path, options = {}) {
-  const response = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
-    ...options,
-    headers: {
-      "Content-Type": "application/json",
-      "apikey": SUPABASE_KEY,
-      "Authorization": `Bearer ${SUPABASE_KEY}`,
-      ...(options.headers || {})
-    }
-  });
+async function initDatabase() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS reservations (
+      id BIGSERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      phone TEXT NOT NULL,
+      email TEXT,
+      date DATE NOT NULL,
+      room TEXT NOT NULL,
+      start_time TIME NOT NULL,
+      end_time TIME NOT NULL,
+      amount INTEGER NOT NULL,
+      payment_method TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending_payment',
+      transaction_nsu TEXT,
+      capture_method TEXT,
+      receipt_url TEXT,
+      paid_amount INTEGER,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+}
 
-  const text = await response.text();
-
-  if (!response.ok) {
-    throw new Error(text || "Erro no banco de dados");
-  }
-
-  return text ? JSON.parse(text) : null;
+function validTime(time) {
+  return /^([01]\\d|2[0-3]):[0-5]\\d$/.test(time);
 }
 
 function hoursBetween(start, end) {
   const [sh, sm] = start.split(":").map(Number);
   const [eh, em] = end.split(":").map(Number);
-  return ((eh * 60 + em) - (sh * 60 + sm)) / 60;
+
+  return (eh * 60 + em - (sh * 60 + sm)) / 60;
 }
 
-function validTime(time) {
-  return /^([01][0-9]|2[0-3]):[0-5][0-9]$/.test(time);
+async function isAvailable(date, room, start, end) {
+  const result = await pool.query(
+    `
+    SELECT id
+    FROM reservations
+    WHERE date = $1
+      AND room = $2
+      AND status IN ('confirmed', 'pending_payment')
+      AND start_time < $4::time
+      AND end_time > $3::time
+    LIMIT 1
+    `,
+    [date, room, start, end]
+  );
+
+  return result.rows.length === 0;
 }
 
-app.get("/", (req, res) => {
-  res.send(`
+function page(title, body) {
+  return `
 <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Consultório Franciely Busanello</title>
+<title>${title}</title>
 <style>
 *{box-sizing:border-box}
 body{
   margin:0;
-  font-family:Arial,sans-serif;
-  background:#f7f4f1;
+  font-family:Arial,Helvetica,sans-serif;
+  background:#f7f5f2;
   color:#333;
 }
 header{
   background:white;
-  padding:28px 20px;
+  padding:24px 18px;
   text-align:center;
-  box-shadow:0 2px 10px #0001;
+  border-bottom:1px solid #eee;
 }
-h1{margin:0;color:#5d4a42;font-size:27px}
-.subtitle{margin-top:8px;color:#777}
+header h1{
+  margin:0;
+  font-size:25px;
+  color:#574b45;
+}
+header p{
+  margin:7px 0 0;
+  color:#777;
+}
 .container{
   max-width:650px;
-  margin:35px auto;
-  padding:0 18px;
+  margin:30px auto;
+  padding:0 16px;
 }
 .card{
   background:white;
   border-radius:18px;
-  padding:25px;
-  box-shadow:0 4px 20px #0001;
+  padding:22px;
+  margin-bottom:18px;
+  box-shadow:0 3px 15px rgba(0,0,0,.06);
 }
-h2{color:#5d4a42}
 label{
   display:block;
-  margin-top:17px;
+  margin-top:14px;
+  margin-bottom:6px;
   font-weight:bold;
 }
 input,select{
   width:100%;
   padding:13px;
-  margin-top:7px;
   border:1px solid #ddd;
   border-radius:10px;
   font-size:16px;
+  background:white;
 }
 button{
   width:100%;
-  margin-top:25px;
+  margin-top:20px;
   padding:15px;
   border:0;
-  border-radius:10px;
-  background:#80695d;
+  border-radius:11px;
+  background:#66544b;
   color:white;
   font-size:17px;
   font-weight:bold;
 }
-.price{
-  margin-top:20px;
-  padding:15px;
-  background:#f4eee9;
-  border-radius:10px;
-  text-align:center;
-  font-size:18px;
+button:disabled{
+  opacity:.5;
 }
-.info{
-  margin-top:20px;
-  color:#777;
-  font-size:14px;
-  line-height:1.5;
+.price{
+  font-size:24px;
+  font-weight:bold;
+  color:#66544b;
+  margin-top:18px;
 }
 .success{
   text-align:center;
-  padding:30px 10px;
+  padding:25px 5px;
+}
+.slot{
+  padding:12px;
+  border:1px solid #ddd;
+  border-radius:9px;
+  margin-top:8px;
 }
 </style>
 </head>
-
 <body>
 <header>
-<h1>Consultório FRANCIELY BUSANELLO</h1>
-<div class="subtitle">Agendamento de salas</div>
+<h1>Consultório Franciely Busanello</h1>
+<p>Sublo­cação de salas por hora</p>
 </header>
-
 <div class="container">
+${body}
+</div>
+</body>
+</html>
+`;
+}
+
+app.get("/", async (req, res) => {
+  res.send(
+    page(
+      "Consultório Franciely Busanello",
+      `
 <div class="card">
+<h2>Agende sua sala</h2>
+<p>Escolha a sala, data e horário.</p>
 
-<h2>Reserve sua sala</h2>
-
-<form id="form">
+<form id="bookingForm">
 
 <label>Nome</label>
 <input id="name" required>
@@ -150,123 +207,118 @@ button{
 <input id="date" type="date" required>
 
 <label>Sala</label>
-<select id="room">
-<option value="Sala 1">Sala 1</option>
-<option value="Sala 2">Sala 2</option>
-<option value="Sala 3">Sala 3</option>
+<select id="room" required>
+<option value="">Selecione</option>
+${ROOMS.map(r => `<option>${r}</option>`).join("")}
 </select>
 
 <label>Horário de início</label>
-<input id="start" type="time" min="07:00" max="21:00" required>
+<select id="start" required></select>
 
 <label>Horário de término</label>
-<input id="end" type="time" min="08:00" max="22:00" required>
+<select id="end" required></select>
+
+<div class="price">
+Valor: R$ <span id="amount">30,00</span>
+</div>
 
 <label>Forma de pagamento</label>
-<select id="payment">
+<select id="payment_method" required>
+<option value="">Selecione</option>
+<option value="cash">Dinheiro</option>
 <option value="pix">Pix</option>
 <option value="credit_card">Cartão de crédito</option>
-<option value="cash">Dinheiro</option>
 </select>
 
-<div class="price" id="price">
-Valor: R$ 30,00
-</div>
-
-<button type="submit">Continuar</button>
-
-<div class="info">
-Atendimento das 07h às 22h.<br>
-Valor da sala: R$ 30,00 por hora.<br>
-Para Pix e cartão, a reserva será confirmada após a aprovação do pagamento.
-</div>
-
+<button type="submit">Agendar horário</button>
 </form>
-</div>
+
+<div id="message"></div>
 </div>
 
 <script>
 const start = document.getElementById("start");
 const end = document.getElementById("end");
-const price = document.getElementById("price");
+const amount = document.getElementById("amount");
 
-function updatePrice(){
-  if(!start.value || !end.value) return;
+for(let h=7; h<=21; h++){
+  const time = String(h).padStart(2,"0")+":00";
+  start.innerHTML += "<option value='"+time+"'>"+time+"</option>";
+  end.innerHTML += "<option value='"+String(h+1).padStart(2,"0")+":00'>"+String(h+1).padStart(2,"0")+":00</option>";
+}
 
-  const [sh,sm] = start.value.split(":").map(Number);
-  const [eh,em] = end.value.split(":").map(Number);
+function updateAmount(){
+  const s=start.value;
+  const e=end.value;
 
-  const hours = ((eh*60+em)-(sh*60+sm))/60;
+  if(!s || !e) return;
 
-  if(hours > 0){
-    price.textContent =
-      "Valor: R$ " + (hours*30).toFixed(2).replace(".",",");
+  const sh=parseInt(s.split(":")[0]);
+  const eh=parseInt(e.split(":")[0]);
+
+  const hours=eh-sh;
+
+  if(hours>0){
+    amount.textContent=(hours*30).toFixed(2).replace(".",",");
   }
 }
 
-start.addEventListener("change",updatePrice);
-end.addEventListener("change",updatePrice);
+start.addEventListener("change",updateAmount);
+end.addEventListener("change",updateAmount);
 
-document.getElementById("form").addEventListener("submit", async e=>{
+document.getElementById("bookingForm").addEventListener("submit",async(e)=>{
   e.preventDefault();
 
-  const data = {
-    name: document.getElementById("name").value,
-    phone: document.getElementById("phone").value,
-    email: document.getElementById("email").value,
-    date: document.getElementById("date").value,
-    room: document.getElementById("room").value,
-    start: start.value,
-    end: end.value,
-    payment_method: document.getElementById("payment").value
+  const data={
+    name:document.getElementById("name").value,
+    phone:document.getElementById("phone").value,
+    email:document.getElementById("email").value,
+    date:document.getElementById("date").value,
+    room:document.getElementById("room").value,
+    start_time:start.value,
+    end_time:end.value,
+    payment_method:document.getElementById("payment_method").value
   };
 
-  const button = e.target.querySelector("button");
-  button.disabled = true;
-  button.textContent = "Verificando disponibilidade...";
+  const message=document.getElementById("message");
+  message.innerHTML="<p>Verificando horário...</p>";
 
   try{
-    const response = await fetch("/api/booking",{
+    const response=await fetch("/api/reservations",{
       method:"POST",
       headers:{"Content-Type":"application/json"},
       body:JSON.stringify(data)
     });
 
-    const result = await response.json();
+    const result=await response.json();
 
     if(!response.ok){
-      throw new Error(result.error || "Não foi possível realizar a reserva.");
-    }
-
-    if(result.payment_url){
-      window.location.href = result.payment_url;
+      message.innerHTML="<p>"+result.error+"</p>";
       return;
     }
 
-    document.querySelector(".card").innerHTML = `
-      <div class="success">
-        <h2>Reserva realizada! ✅</h2>
-        <p>${result.message}</p>
-        <p><strong>Sala:</strong> ${data.room}</p>
-        <p><strong>Data:</strong> ${data.date}</p>
-        <p><strong>Horário:</strong> ${data.start} às ${data.end}</p>
-      </div>
-    `;
+    if(result.payment_url){
+      window.location.href=result.payment_url;
+      return;
+    }
+
+    message.innerHTML=
+      "<div class='success'><h2>Agendamento realizado! ✅</h2>"+
+      "<p>"+result.message+"</p></div>";
+
+    document.getElementById("bookingForm").reset();
 
   }catch(error){
-    alert(error.message);
-    button.disabled = false;
-    button.textContent = "Continuar";
+    message.innerHTML="<p>Não foi possível realizar o agendamento.</p>";
   }
 });
 </script>
-
-</body>
-</html>
-  `);
+`
+    )
+  );
 });
 
-app.post("/api/booking", async (req, res) => {
+app.post("/api/reservations", async (req, res) => {
   try {
     const {
       name,
@@ -274,231 +326,276 @@ app.post("/api/booking", async (req, res) => {
       email,
       date,
       room,
-      start,
-      end,
+      start_time,
+      end_time,
       payment_method
     } = req.body;
 
-    if (!name || !phone || !date || !room || !start || !end || !payment_method) {
-      return res.status(400).json({error:"Preencha todos os campos obrigatórios."});
+    if (!name || !phone || !date || !room || !start_time || !end_time) {
+      return res.status(400).json({
+        error: "Preencha todos os campos obrigatórios."
+      });
     }
 
-    if (!validTime(start) || !validTime(end)) {
-      return res.status(400).json({error:"Horário inválido."});
+    if (!ROOMS.includes(room)) {
+      return res.status(400).json({
+        error: "Sala inválida."
+      });
     }
 
-    const hours = hoursBetween(start, end);
-
-    if (hours <= 0 || hours > 15) {
-      return res.status(400).json({error:"O horário informado é inválido."});
+    if (!validTime(start_time) || !validTime(end_time)) {
+      return res.status(400).json({
+        error: "Horário inválido."
+      });
     }
 
-    if (start < "07:00" || end > "22:00") {
-      return res.status(400).json({error:"O consultório funciona das 07h às 22h."});
+    const hours = hoursBetween(start_time, end_time);
+
+    if (hours <= 0 || !Number.isInteger(hours)) {
+      return res.status(400).json({
+        error: "O período deve ser de horas inteiras."
+      });
     }
 
-    const conflicts = await supabase(
-      `reservations?select=id&date=eq.${date}&room=eq.${encodeURIComponent(room)}&start_time=lt.${end}&end_time=gt.${start}&status=in.(confirmed,pending_payment)`
+    if (start_time < "07:00" || end_time > "22:00") {
+      return res.status(400).json({
+        error: "O consultório funciona das 07:00 às 22:00."
+      });
+    }
+
+    const available = await isAvailable(
+      date,
+      room,
+      start_time,
+      end_time
     );
 
-    if (conflicts && conflicts.length > 0) {
+    if (!available) {
       return res.status(409).json({
-        error:"Esse horário já está reservado para esta sala."
+        error: "Esse horário já está reservado."
       });
     }
 
     const amount = Math.round(hours * PRICE_PER_HOUR * 100);
 
-    const reservation = await supabase("reservations", {
-      method:"POST",
-      headers:{
-        "Prefer":"return=representation"
-      },
-      body:JSON.stringify({
+    let status =
+      payment_method === "cash"
+        ? "confirmed"
+        : "pending_payment";
+
+    const inserted = await pool.query(
+      `
+      INSERT INTO reservations
+      (name, phone, email, date, room, start_time, end_time,
+       amount, payment_method, status)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+      RETURNING id
+      `,
+      [
         name,
         phone,
-        email,
+        email || null,
         date,
         room,
-        start_time:start,
-        end_time:end,
+        start_time,
+        end_time,
         amount,
         payment_method,
-        status: payment_method === "cash"
-          ? "confirmed"
-          : "pending_payment"
-      })
-    });
+        status
+      ]
+    );
 
-    const booking = reservation[0];
+    const reservationId = inserted.rows[0].id;
 
     if (payment_method === "cash") {
       return res.json({
-        message:"Sua reserva foi registrada. O pagamento será realizado em dinheiro."
+        success: true,
+        message:
+          "Seu horário foi reservado. O pagamento será realizado em dinheiro."
       });
     }
 
-    if (!INFINITEPAY_HANDLE) {
+    if (!process.env.INFINITEPAY_HANDLE) {
       return res.status(500).json({
-        error:"InfinitePay ainda não foi configurada."
+        error:
+          "O pagamento online ainda não foi configurado no sistema."
       });
     }
 
     const baseUrl =
-      process.env.PUBLIC_URL ||
-      `${req.protocol}://${req.get("host")}`;
+      process.env.BASE_URL ||
+      `http://localhost:${PORT}`;
 
-    const orderNsu = String(booking.id);
+    const orderNsu = `reserva-${reservationId}`;
 
-    const checkout = await fetch(
+    const paymentResponse = await fetch(
       "https://api.checkout.infinitepay.io/links",
       {
-        method:"POST",
-        headers:{
-          "Content-Type":"application/json"
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
         },
-        body:JSON.stringify({
-          handle:INFINITEPAY_HANDLE,
-          order_nsu:orderNsu,
-          redirect_url:`${baseUrl}/pagamento-concluido`,
-          webhook_url:`${baseUrl}/webhook-infinitepay`,
-          customer:{
+        body: JSON.stringify({
+          handle: process.env.INFINITEPAY_HANDLE,
+          order_nsu: orderNsu,
+          redirect_url: `${baseUrl}/pagamento-concluido`,
+          webhook_url: `${baseUrl}/webhook-infinitepay`,
+          customer: {
             name,
-            email,
-            phone_number:phone
+            email: email || undefined,
+            phone_number: phone
           },
-          items:[
+          items: [
             {
-              quantity:1,
-              price:amount,
-              description:`Reserva ${room} - ${date} ${start} às ${end}`
+              quantity: 1,
+              price: amount,
+              description: `${room} - ${date} ${start_time} às ${end_time}`
             }
           ]
         })
       }
     );
 
-    const checkoutData = await checkout.json();
+    const paymentData = await paymentResponse.json();
 
-    if (!checkout.ok || !checkoutData.url) {
-      console.error(checkoutData);
+    if (!paymentResponse.ok || !paymentData.url) {
+      await pool.query(
+        `UPDATE reservations SET status='cancelled' WHERE id=$1`,
+        [reservationId]
+      );
 
       return res.status(500).json({
-        error:"Não foi possível criar o pagamento."
+        error: "Não foi possível gerar o pagamento."
       });
     }
 
-    res.json({
-      payment_url:checkoutData.url
+    return res.json({
+      success: true,
+      payment_url: paymentData.url
     });
 
-  } catch(error) {
+  } catch (error) {
     console.error(error);
-    res.status(500).json({
-      error:"Erro interno do sistema."
+
+    return res.status(500).json({
+      error: "Erro interno ao criar o agendamento."
     });
   }
 });
 
-app.post("/webhook-infinitepay", async (req,res)=>{
+app.post("/webhook-infinitepay", async (req, res) => {
   try {
-    const {
-      order_nsu,
-      amount,
-      paid_amount,
-      transaction_nsu,
-      capture_method,
-      receipt_url
-    } = req.body;
+    const data = req.body;
 
-    if (!order_nsu) {
+    const orderNsu = data.order_nsu;
+
+    if (!orderNsu) {
       return res.status(400).json({
-        success:false,
-        message:"Pedido não encontrado"
+        success: false,
+        message: "Pedido não encontrado"
       });
     }
 
-    const reservations = await supabase(
-      `reservations?id=eq.${encodeURIComponent(order_nsu)}&select=*`
+    const reservationId = String(orderNsu).replace("reserva-", "");
+
+    const result = await pool.query(
+      `SELECT * FROM reservations WHERE id=$1`,
+      [reservationId]
     );
 
-    if (!reservations || reservations.length === 0) {
+    if (!result.rows.length) {
       return res.status(400).json({
-        success:false,
-        message:"Reserva não encontrada"
+        success: false,
+        message: "Pedido não encontrado"
       });
     }
 
-    const reservation = reservations[0];
+    const reservation = result.rows[0];
 
-    if (Number(amount) !== Number(reservation.amount)) {
+    if (
+      Number(data.amount) !== Number(reservation.amount)
+    ) {
       return res.status(400).json({
-        success:false,
-        message:"Valor diferente do esperado"
+        success: false,
+        message: "Valor do pagamento não confere"
       });
     }
 
-    await supabase(`reservations?id=eq.${encodeURIComponent(order_nsu)}`,{
-      method:"PATCH",
-      body:JSON.stringify({
-        status:"confirmed",
-        transaction_nsu,
-        capture_method,
-        receipt_url,
-        paid_amount
-      })
+    await pool.query(
+      `
+      UPDATE reservations
+      SET status='confirmed',
+          transaction_nsu=$1,
+          capture_method=$2,
+          receipt_url=$3,
+          paid_amount=$4
+      WHERE id=$5
+      `,
+      [
+        data.transaction_nsu || null,
+        data.capture_method || null,
+        data.receipt_url || null,
+        data.paid_amount || data.amount,
+        reservationId
+      ]
+    );
+
+    return res.status(200).json({
+      success: true,
+      message: null
     });
 
-    res.status(200).json({
-      success:true,
-      message:null
-    });
-
-  } catch(error) {
+  } catch (error) {
     console.error(error);
 
-    res.status(400).json({
-      success:false,
-      message:"Erro ao confirmar pagamento"
+    return res.status(400).json({
+      success: false,
+      message: "Erro ao processar pagamento"
     });
   }
 });
 
-app.get("/pagamento-concluido",(req,res)=>{
-  res.send(`
-  <!DOCTYPE html>
-  <html lang="pt-BR">
-  <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Pagamento concluído</title>
-  <style>
-  body{
-    font-family:Arial;
-    background:#f7f4f1;
-    text-align:center;
-    padding:60px 20px;
-  }
-  .box{
-    max-width:500px;
-    margin:auto;
-    background:white;
-    padding:35px;
-    border-radius:20px;
-  }
-  </style>
-  </head>
-  <body>
-  <div class="box">
-  <h1>Pagamento recebido! ✅</h1>
-  <p>Seu pagamento foi encaminhado para confirmação.</p>
-  <p>Sua reserva será liberada após a confirmação do pagamento.</p>
-  </div>
-  </body>
-  </html>
-  `);
+app.get("/pagamento-concluido", (req, res) => {
+  res.send(
+    page(
+      "Pagamento concluído",
+      `
+      <div class="card success">
+        <h2>Pagamento recebido! ✅</h2>
+        <p>Seu pagamento foi encaminhado para confirmação.</p>
+        <p>Seu horário será confirmado automaticamente.</p>
+        <a href="/" style="display:block;margin-top:20px">
+          Voltar para o início
+        </a>
+      </div>
+      `
+    )
+  );
 });
 
-app.listen(PORT,()=>{
-  console.log(`Consultório rodando na porta ${PORT}`);
+app.get("/api/reservations", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT *
+      FROM reservations
+      ORDER BY date, start_time
+    `);
+
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({
+      error: "Não foi possível consultar as reservas."
+    });
+  }
 });
+
+initDatabase()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`Servidor funcionando na porta ${PORT}`);
+    });
+  })
+  .catch(error => {
+    console.error("Erro ao iniciar banco:", error);
+    process.exit(1);
+  });
